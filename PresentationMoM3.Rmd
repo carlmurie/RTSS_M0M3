@@ -1,0 +1,1219 @@
+---
+title: "RTSS Project Report"
+subtitle: "Presentation of secondary analyses"
+author: "Carl Murie and Raphael Gottardo"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+autosize: false
+output: 
+  ioslides_presentation:
+    incremental: no
+    keep_md: yes
+    smaller: no
+    
+---
+ 
+```{r overall-knitr-options, cache=FALSE, echo=FALSE, message=FALSE, warning=FALSE, results="hide"}
+library(knitr)
+opts_chunk$set(cache=FALSE, eval=TRUE, echo=FALSE, message=FALSE, warning=FALSE, results='asis')
+
+library(Biobase)
+library(data.table)
+library(ggplot2)
+library(gridExtra)
+library(limma)
+library(edgeR)
+library(xtable)
+library(GSEABase)
+library(DT)
+library(plyr)     ## join
+library(stringr)  ## str_trim
+
+DOFIT <- FALSE ## if TRUE run lmFit, otherwise read it from file.
+DOGSEA <- TRUE ## if FALSE read results from file
+QUIET <- TRUE
+ROOT <- "/shared/silo_researcher/Gottardo_R/cmurie_working/RTSS/RTSS_Full/"
+DOMDS <- FALSE
+FDRCut <- 0.2
+
+
+dat <- read.table( paste0(ROOT, "data/allData.txt"), sep="\t")
+##anno <- read.csv( paste0(ROOT, "data/RTSSFullPheno.csv"))dfssdfadfs
+anno <- read.csv( paste0(ROOT, "data/RTSSFullPheno_20170829.csv"))
+
+numberOfSubs <- length(unique(anno$SID))
+
+## investigate a discrepancy between "case" and "malaria"
+if(FALSE) {
+    tmp <- anno[anno$rna_seq_casecon.m12!="case" & anno$rna_seq_casecon.m12!="control" &
+                  anno$malaria==1, ]
+    pids <- sort(unique(tmp$pid))
+    cols <- c("pid", "visit", "vaccine", "rna_seq_casecon.m12", "malaria", "stimulation",
+              "rna_seq_match_id_m12")    
+    outie <- NULL
+    for(p in pids) {
+      outie <- rbind(outie, anno[anno$pid==p,])
+    }
+    outie1 <- outie[,cols]
+    write.csv(outie1, paste(ROOT, "data/malariaStrange.csv", sep=""))
+
+    indy <- match(uPheno$pid, pids)
+    tmp2 <- uPheno[uPheno$pid==unique(tmp$pid), ]
+}
+
+## get plate locations of controls
+controls <- setdiff(colnames(dat), anno$colID)
+
+## separate controls from biological samples
+conInd <- match(controls, colnames(dat))
+conDat <- dat[,conInd]
+bDat <- dat[,-conInd]
+
+## make sure the phenotype and data files are ordered the same
+ordInd <- match( colnames(bDat), anno$colID)
+bPheno <- anno[ordInd,]
+if(sum(colnames(bDat) != bPheno$colID) != 0) {stop("ERROR: column names of data don't match annotation file")}
+
+numSub <- ncol(bDat)
+
+ geneCut <- 20
+ sampCut <- 75000
+ pCut <- 0.01
+ FDRCut <- 0.2
+ 
+ ### remove low read samples
+ totReads <- apply(bDat, 2, sum)
+ dInd <- totReads <= sampCut
+ deletes <- sum(dInd)
+ dRan <- range(totReads[dInd])
+  
+ ## get idea of low to mid sample reads
+ mInd <- totReads > sampCut & totReads <= 300000
+ mids <- sum(mInd)
+ mRan <- range(totReads[mInd])
+ 
+  sampInd <- totReads > sampCut
+  totReadsF <- uRan <- range(totReads[sampInd])
+  fDat <- bDat[,sampInd]
+  
+ ## filter genes with low read counts. Gene needs at least 20 samples with reads >= 5
+ summ <- apply(fDat, 1, function(x) sum(x >= 5))
+ summInd <- summ > geneCut
+ 
+ ## before summing across technical replicates
+ numGenes <- apply(bDat, 2, function(x) sum(x!=0))
+ noZeros <- apply(bDat, 1, function(x) sum(x!=0))
+ 
+ uDat <- fDat[summInd,]
+ uPheno <- bPheno[sampInd,]
+ if(sum(colnames(uDat) != uPheno$colID) != 0) {stop("ERROR: column names of data don't match annotation file")}
+ 
+ ## calculate library normalization weights (TMM)
+ eDat <- ExpressionSet(assayData=as.matrix(uDat))
+ normy <- calcNormFactors(eDat)
+ libNorm <- colSums(exprs(eDat))*normy
+ names(libNorm) <- colnames(uDat)
+ 
+  ## remove ama1 from study
+  amaInd <- uPheno$stimulation == "ama1"
+  uDat <- uDat[,!amaInd]
+  uPheno <- uPheno[!amaInd,]
+  libNorm <- libNorm[!amaInd]
+
+  ## set up factors, relevel, rename
+  uPheno$age <- factor(uPheno$agec, levels=unique(uPheno$agec),
+                      labels=c("young", "old"))
+  uPheno$agec <- NULL
+  uPheno$stimulation <- factor(uPheno$stimulation, c("dmso", "csp", "hbs"))
+  uPheno$vaccine <- relevel(uPheno$vaccine, "comparator")
+  uPheno <- plyr::rename(uPheno, c("rna_seq_casecon.m12" = "case"))
+  uPheno$case <- relevel(uPheno$case, "control")
+  uPheno <- plyr::rename(uPheno, c("rna_seq_match_id_m12"="match")) 
+  uPheno$TotalReads <- apply(uDat, 2, sum)
+  uPheno$malaria <- factor(uPheno$malaria)
+   
+   ## set up the gmt gene sets
+   btmFile <- "/shared/silo_researcher/Gottardo_R/10_ref_files/GMT/BTM_for_GSEA_20131008.gmt"
+   minGeneSetCut <- 5
+   geneSet <- getGmt(btmFile)
+   geneIds <- geneIds(geneSet)
+   setsIndices <- ids2indices(geneIds, rownames(uDat))
+   setsIndices <- setsIndices[sapply(setsIndices, length) > minGeneSetCut]
+
+ 
+```
+
+
+
+## Experimental Design
+
+Bulk RNASeq experiment assessing the effect of different stimulation on subjects treated with the RTSS malaria vaccine or comparator. There were a total of `r ncol(bDat)` samples.
+
+**Subjects**: `r numberOfSubs` subjects.
+
+**Vaccine**: rtss and comparator
+
+**Stimulation**: dmso, csp, hbs
+
+**Location**: bagamoyo and manhica
+
+**Age**: 6-12 weeks (young) and 5-17 months (old).
+
+**Outcome**: control (no malaria) and case (malaria)
+
+**Visit**: M0 and M3 (initial visit and 3 months later)
+
+
+##Analysis
+
+Reads were aligned using BWA Aln version 0.7.10. The transcriptome was downloaded from
+UCSC RefSeq (Human 19 or Mouse 10). Mitochondrial genes and ERCC reference sequences were
+added. Sequence alignment and quantification were run at Broad Technology Labs. The data was voom transformed and a linear model was applied for statistical testing.
+
+Samples with total read counts less than `r as.integer(sampCut)` were removed. Genes that did not have at least `r geneCut` samples (approximately 10% of the sample size) with read counts greater than 5 were removed. 
+
+There were `r ncol(uDat)` samples and `r nrow(uDat)` genes remaining after filtering. 
+
+##Statistical Analysis
+
+Test disease stimulation interaction on only M0 samples. (y~disease*stimulation)
+
+Test stimulation visit interaction on both M0 and M3 sites. RTSS samples only. Only includes samples where stimulation samples are present in both M0 and M3 (y~stimulation*visit)
+
+Test disease effects (malaria factor) on M3 samples (rtss and comparator) for age levels together and separately. (y~disease)
+
+
+```{r gseaM0, results="asis"}
+ 
+  ############################## GSEA analysis #############################
+
+   ## generate M0 data set
+   M0Ind <- uPheno$visit == "M0"
+   M0Dat <- uDat[,M0Ind]
+   M0Pheno <- uPheno[M0Ind,]
+   libNormM0 <- libNorm[M0Ind]
+   eDatM0 <- ExpressionSet(assayData=as.matrix(M0Dat))
+   pData(eDatM0) <- M0Pheno
+   
+   ## get sample sizes
+   t1 <- table(M0Pheno[, c("stimulation", "malaria", "site")])
+   t2 <- table(M0Pheno[, c("stimulation", "vaccine", "site")])
+   bag <- cbind(t1[,,1], t2[,,1])
+   man <- cbind(t1[,,2], t2[,,2])
+   colnames(bag)[1:2] <- colnames(man)[1:2] <- c("no malaria", "malaria")
+   
+   ## apply M0 malaria*stimulation model
+   myDesM0 <- model.matrix(~plate + TotalReads + malaria*stimulation, eDatM0)
+   vM0 <- voom(exprs(eDatM0), design=myDesM0, plot=FALSE, lib.size=libNormM0)
+   coefsM0<- colnames(myDesM0)[8:11]
+   cLabs <- c("csp", "hbs", "malaria:stim: csp", "malaria:stim: hbs")
+ 
+    gMat <- NULL ## retain summary statistics
+    gM0 <- list()
+    coefInd <- 0
+    for(c in coefsM0) {
+         coefInd <- coefInd+1
+        res <- camera(vM0, setsIndices, design=myDesM0, contrast=c, sort=TRUE)
+        indo <- res$FDR <= FDRCut
+        gMat <- c(gMat, sum(indo))
+        lab <- paste("M0", cLabs[coefInd])
+        
+        if(sum(indo) > 0) {
+            gM0[[lab]] <- cbind(res[indo, c("NGenes", "Direction")], 
+                                        signif(res[indo, c("PValue","FDR")], 3))
+        }
+        else {
+          gM0[[lab]] <- -1
+        }
+        
+    } ## end for c
+    
+    ## set up summary for printing
+    printgM0 <- matrix(gMat, nrow=2, byrow=TRUE)
+    dimnames(printgM0) <- list(c("main", "interaction"), c("csp", "hbs"))
+    printgM0a <- matrix(printgM0[2,], ncol=1)
+    dimnames(printgM0a) <- list(c("csp", "hbs"), "interaction")
+        
+    ## create output string to present datatables
+   outM0 = NULL
+   for (i in 3:4) {
+    
+        ## malaria model
+        knit_expanded <- paste0("##`r names(gM0)[",i, "]` {.smaller}\n")
+        outM0 = c(outM0, knit_expanded)
+        
+         if(is.null(dim(gM0[[i]]))) {
+               knit_expanded <- "No significant gene sets found\n" 
+          }else {
+            knit_expanded <-  paste0("`r datatable(gM0[[", i, "]])`\n")
+          }
+        outM0 = c(outM0, knit_expanded)
+   } ## end for i
+    
+   
+   ## calculate delta scores and produce boxplots for presentation.
+   if(FALSE) {
+  
+        pheno <- M0Pheno
+        dat <- vM0$E
+        delta <- stimFac <- caseFac <- ageFac <- vaccineFac <- malFac <- NULL
+        for(s in unique(pheno$SID)) {
+           for(stim in c("csp", "hbs")) {
+               indStim <- pheno$SID==s & pheno$stimulation==stim
+               indDMSO <- pheno$SID==s & pheno$stimulation=="dmso"
+               if(sum(indStim == 1) & sum(indDMSO == 1)) {
+                   if(pheno$case[indStim] != pheno$case[indDMSO]) {stop("ERROR case")}
+                   if(pheno$age[indStim] != pheno$age[indDMSO]) {stop("ERROR age")}
+                   delta <- cbind(delta, dat[,indStim] - dat[,indDMSO])
+                   stimFac <- c(stimFac, stim)
+                   caseFac <- c(caseFac, as.character(pheno$case[indStim]))
+                   ageFac <- c(ageFac, as.character(pheno$age[indStim]))
+                   malFac <- c(malFac, as.character(pheno$malaria[indStim]))
+                   vaccineFac <- c(vaccineFac, as.character(pheno$vaccine[indStim]))
+               } ## end for sum
+           } ## end for stim
+        } ## end for s
+        
+     ## get hbs data
+     hbsInd <- stimFac=="hbs"
+     hbsDat <- delta[,hbsInd]
+     caseHbs <- caseFac[hbsInd]
+     caseHbs[caseHbs!="case" & caseHbs!= "control" ] <- "empty"  ## change "" to "empty"
+     ageHbs <- ageFac[hbsInd]
+     malHbs <- malFac[hbsInd]
+     
+     ## get genes for gene set of interest
+     setName <- rownames(gM0[[4]])[1]
+     geneNames <- geneIds[[setName]] 
+     setDat <- delta[intersect(geneNames, rownames(hbsDat)), hbsInd]
+     
+     ## look at group means
+     mMal <- apply(setDat[,malHbs==1], 2, mean)
+     mNoMal <- apply(setDat[,malHbs==0], 2, mean)
+     print(mean(mMal) - mean(mNoMal))
+      
+      ## melt age factor  
+     colnames(setDat) <- ageHbs
+     dt <- melt(setDat)
+     colnames(dt) <-  c("gene", "age", "expression")
+     colnames(setDat) <- caseHbs
+     dt$disease <- melt(setDat)$Var2
+     dt$disease <- factor(dt$disease, levels=c("case", "control", "empty"), ordered=TRUE,
+                       labels=c("case", "con", "null")) 
+     colnames(setDat) <- malHbs
+     dt$malaria <- factor(melt(setDat)$Var2, levels=c("1", "0"), labels=c("mal", "noMal"))
+     
+      gHbs <- ggplot(data=dt, aes(x=disease, y=expression)) + 
+                                 geom_boxplot(outlier.size=-1) + 
+        geom_jitter(alpha=0.3, size=0.5)  +
+        facet_wrap(~gene, scales= "free", ncol=6) + ggtitle(setName) + theme(aspect.ratio=1)
+     
+      gMal <- ggplot(data=dt, aes(x=malaria, y=expression)) + 
+                                 geom_boxplot(outlier.size=-1) + 
+        geom_jitter(alpha=0.3, size=0.5)  +
+        facet_wrap(~gene, scales= "free", ncol=6) + ggtitle(setName) + theme(aspect.ratio=1)
+      
+     
+      
+     pdf(file=paste0(ROOT, "/plots/boxPlotTBA.pdf"))
+     print(gHbs)
+     print(gMal)
+     dev.off()
+     
+   } ## end if FALSE
+   
+  
+```
+
+
+##Sample Sizes: disease stimulation interaction (M0 only)
+
+<table border = 1>
+<tr>
+<td>
+```{r results='asis', echo=FALSE}
+   print(xtable(bag, caption="Bagamoyo", align=rep("c", ncol(bag)+1)), type = "html")
+```
+</td>
+</tr>
+<tr>
+<td>
+```{r results='asis', echo=FALSE}
+   print(xtable(man, caption="Manhica", align=rep("c", ncol(man)+1)), type = "html")
+```
+</td>
+</tr>
+</table>
+   
+<!-- knit GSEA results--> 
+`r paste(knit_child(text = outM0), collapse = '\n')`
+     
+##GSEA summary disease:stimulation interaction| FDR cutoff: `r FDRCut`
+
+Number of significant BTM gene sets for dmso versus stimulants and disease interaction effects.
+
+
+```{r results='asis', echo=FALSE}
+   print(xtable(printgM0a, align=rep("c", ncol(printgM0a)+1), auto=TRUE), type = "html")
+```
+
+
+
+```{r m0-m3, results="asis"}
+
+## M3-M0 stimulation effects
+
+## get data for rtss and have both M0 and M3 effects
+rPheno <- uPheno[uPheno$vaccine=="rtss",]
+mPheno <- outPheno <- NULL
+for(p in unique(rPheno$pid)) {
+  tmp1 <- rPheno[rPheno$pid==p,]
+  for(stim in unique(rPheno$stimulation)) {
+     tmp2 <- tmp1[tmp1$stimulation==stim,]
+     
+     if(nrow(tmp2) == 2 ) {
+        if(sum(tmp2$visit == "M0") > 0 & sum(tmp2$visit == "M3") > 0) {
+           mPheno <- rbind(mPheno, tmp2)
+        }
+     } else {
+        outPheno <- rbind(outPheno, tmp2)
+     }
+  }
+}
+
+## get matching samples
+mDat <- uDat[, as.character(mPheno$colID)]
+if(sum(colnames(mDat) != mPheno$colID) != 0) {print("PROBLEM: mDat mPheno do not match")}
+libNormm <- libNorm[as.character(mPheno$colID)]
+eDatm <- ExpressionSet(assayData=as.matrix(mDat))
+pData(eDatm) <- mPheno
+
+ ## get sample sizes
+ t1 <- table(mPheno[, c("stimulation", "malaria", "site")])
+ t2 <- table(mPheno[, c("stimulation", "visit", "site")])
+ bag <- cbind(t1[,,1], t2[,,1])
+ man <- cbind(t1[,,2], t2[,,2])
+ colnames(bag)[1:2] <- colnames(man)[1:2] <- c("no malaria", "malaria")
+
+ ## apply M0 visit*stimulation model
+ myDesm <- model.matrix(~plate + TotalReads + visit*stimulation, eDatm)
+ vm <- voom(exprs(eDatm), design=myDesm, plot=FALSE, lib.size=libNormm)
+ coefsm<- colnames(myDesm)[10:11]
+ 
+ coefLabm <- c("M3-M0 csp-DMSO interaction", "M3-M0 hsb-DMSO interaction")
+ 
+   gMat <- NULL ## retain summary statistics
+    gM <- list()
+    coefInd <- 0
+    for(c in coefsm) {
+        coefInd <- coefInd + 1
+        res <- camera(vm, setsIndices, design=myDesm, contrast=c, sort=TRUE)
+        indo <- res$FDR <= FDRCut
+        gMat <- c(gMat, sum(indo))
+        lab <- coefLabm[coefInd]
+        
+        if(sum(indo) > 0) {
+            gM[[lab]] <- cbind(res[indo, c("NGenes", "Direction")], 
+                                        signif(res[indo, c("PValue","FDR")], 3))
+        }
+        else {
+          gM[[lab]] <- -1
+        }
+        
+    } ## end for c
+    
+    printgM <- matrix(gMat, ncol=1)
+    dimnames(printgM) <- list(c("csp", "hbs"), "visit:stimulation interaction")
+    
+   ## create output string to present datatables
+   outm = NULL
+   for (i in 1:2) {
+    
+        ## malaria model
+        knit_expanded <- paste0("##`r names(gM)[",i, "]` {.smaller}\n")
+        outm = c(outm, knit_expanded)
+        
+         if(is.null(dim(gM[[i]]))) {
+               knit_expanded <- "No significant gene sets found\n" 
+          }else {
+            knit_expanded <-  paste0("`r datatable(gM[[", i, "]])`\n")
+          }
+        outm = c(outm, knit_expanded)
+   } ## end for i
+    
+
+```
+
+
+##Sample Sizes: visit stimulation interaction (RTSS only)
+
+<table border = 1>
+<tr>
+<td>
+```{r results='asis', echo=FALSE}
+   print(xtable(bag, caption="Bagamoyo", align=rep("c", ncol(bag)+1)), type = "html")
+```
+</td>
+</tr>
+<tr>
+<td>
+```{r results='asis', echo=FALSE}
+   print(xtable(man, caption="Manhica", align=rep("c", ncol(man)+1)), type = "html")
+```
+</td>
+</tr>
+</table>
+   
+
+<!-- knit GSEA results--> 
+`r paste(knit_child(text = outm), collapse = '\n')`
+
+
+```{r m0-m3Comp, results="asis"}
+
+## M3-M0 stimulation effects
+
+## get data for rtss and have both M0 and M3 effects
+rPheno <- uPheno[uPheno$vaccine=="comparator",]
+mPheno <- outPheno <- NULL
+for(p in unique(rPheno$pid)) {
+  tmp1 <- rPheno[rPheno$pid==p,]
+  for(stim in unique(rPheno$stimulation)) {
+     tmp2 <- tmp1[tmp1$stimulation==stim,]
+     
+     if(nrow(tmp2) == 2 ) {
+        if(sum(tmp2$visit == "M0") > 0 & sum(tmp2$visit == "M3") > 0) {
+           mPheno <- rbind(mPheno, tmp2)
+        }
+     } else {
+        outPheno <- rbind(outPheno, tmp2)
+     }
+  }
+}
+
+## get matching samples
+mDat <- uDat[, as.character(mPheno$colID)]
+if(sum(colnames(mDat) != mPheno$colID) != 0) {print("PROBLEM: mDat mPheno do not match")}
+libNormmc <- libNorm[as.character(mPheno$colID)]
+eDatmc <- ExpressionSet(assayData=as.matrix(mDat))
+mPhenoc <- mPheno
+pData(eDatmc) <- mPhenoc
+
+ ## get sample sizes
+ t1 <- table(mPhenoc[, c("stimulation", "malaria", "site")])
+ t2 <- table(mPhenoc[, c("stimulation", "visit", "site")])
+ bag <- cbind(t1[,,1], t2[,,1])
+ man <- cbind(t1[,,2], t2[,,2])
+ colnames(bag)[1:2] <- colnames(man)[1:2] <- c("no malaria", "malaria")
+
+ ## apply M0 visit*stimulation model
+ myDesmc <- model.matrix(~plate + TotalReads + visit*stimulation, eDatmc)
+ vmc <- voom(exprs(eDatmc), design=myDesmc, plot=FALSE, lib.size=libNormmc)
+ 
+ coefLabm <- c("M3-M0 csp-DMSO interaction", "M3-M0 hsb-DMSO interaction")
+ 
+   gMat <- NULL ## retain summary statistics
+    gM <- list()
+    coefInd <- 0
+    for(c in coefsm) {
+        coefInd <- coefInd + 1
+        res <- camera(vmc, setsIndices, design=myDesmc, contrast=c, sort=TRUE)
+        indo <- res$FDR <= FDRCut
+        gMat <- c(gMat, sum(indo))
+        lab <- coefLabm[coefInd]
+        
+        if(sum(indo) > 0) {
+            gM[[lab]] <- cbind(res[indo, c("NGenes", "Direction")], 
+                                        signif(res[indo, c("PValue","FDR")], 3))
+        }
+        else {
+          gM[[lab]] <- -1
+        }
+        
+    } ## end for c
+    
+    printgM <- matrix(gMat, ncol=1)
+    dimnames(printgM) <- list(c("csp", "hbs"), "visit:stimulation interaction")
+    
+   ## create output string to present datatables
+   outm = NULL
+   for (i in 1:2) {
+    
+        ## malaria model
+        knit_expanded <- paste0("##`r names(gM)[",i, "]` {.smaller}\n")
+        outm = c(outm, knit_expanded)
+        
+         if(is.null(dim(gM[[i]]))) {
+               knit_expanded <- "No significant gene sets found\n" 
+          }else {
+            knit_expanded <-  paste0("`r datatable(gM[[", i, "]])`\n")
+          }
+        outm = c(outm, knit_expanded)
+   } ## end for i
+    
+    
+```
+
+
+
+
+##Sample Sizes: visit stimulation interaction (Comparator only)
+
+<table border = 1>
+<tr>
+<td>
+```{r results='asis', echo=FALSE}
+   print(xtable(bag, caption="Bagamoyo", align=rep("c", ncol(bag)+1)), type = "html")
+```
+</td>
+</tr>
+<tr>
+<td>
+```{r results='asis', echo=FALSE}
+   print(xtable(man, caption="Manhica", align=rep("c", ncol(man)+1)), type = "html")
+```
+</td>
+</tr>
+</table>
+   
+
+<!-- knit GSEA results--> 
+`r paste(knit_child(text = outm), collapse = '\n')`
+
+
+
+##GSEA summary visit:stimulation interaction| FDR cutoff: `r FDRCut`
+
+Number of significant BTM gene sets for dmso versus stimulants and visit interaction effects (RTSS only).
+
+
+```{r results='asis', echo=FALSE}
+   print(xtable(printgM, align=rep("c", ncol(printgM)+1), auto=TRUE), type = "html")
+```
+
+
+
+
+```{r gseadmso, results="asis"}
+ 
+  ############################## GSEA analysis #############################
+
+   ## TODO - get sample sizes for all subsets
+   
+   ## generate DMSO data set for both ages
+   dInd <- uPheno$stim == "dmso" & uPheno$visit == "M3"
+   dDat <- uDat[,dInd]
+   dPheno <- uPheno[dInd,]
+   libNormd <- libNorm[dInd]
+   eDatd <- ExpressionSet(assayData=as.matrix(dDat))
+   pData(eDatd) <- dPheno
+
+   ## generate DMSO data set for young
+   dIndy <- uPheno$stim == "dmso" & uPheno$visit == "M3" & uPheno$age=="young"
+   dDaty <- uDat[,dIndy]
+   dPhenoy <- uPheno[dIndy,]
+   libNormdy <- libNorm[dIndy]
+   eDatdy <- ExpressionSet(assayData=as.matrix(dDaty))
+   pData(eDatdy) <- dPhenoy
+
+   ## generate DMSO data set for old
+   dIndo <- uPheno$stim == "dmso" & uPheno$visit == "M3" & uPheno$age=="old"
+   dDato <- uDat[,dIndo]
+   dPhenoo <- uPheno[dIndo,]
+   libNormdo <- libNorm[dIndo]
+   eDatdo <- ExpressionSet(assayData=as.matrix(dDato))
+   pData(eDatdo) <- dPhenoo
+
+    ## get sample sizes
+    t1 <- table(dPheno[, c("age", "malaria", "site")])
+    t2 <- table(dPheno[, c("age", "vaccine", "site")])
+    bag <- cbind(t1[,,1], t2[,,1])
+    man <- cbind(t1[,,2], t2[,,2])
+    colnames(bag)[1:2] <- colnames(man)[1:2] <- c("no malaria", "malaria")
+  
+   ## apply DMSO malaria model
+   myDesd <- model.matrix(~plate + TotalReads + age + malaria, eDatd)
+   myDesdy <- model.matrix(~plate + TotalReads + malaria, eDatdy)
+   myDesdo <- model.matrix(~plate + TotalReads + malaria, eDatdo)
+   
+   vD <- voom(exprs(eDatd), design=myDesd, plot=FALSE, lib.size=libNormd)
+   vDy <- voom(exprs(eDatdy), design=myDesdy, plot=FALSE, lib.size=libNormdy)
+   vDo <- voom(exprs(eDatdo), design=myDesdo, plot=FALSE, lib.size=libNormdo)
+   coefsd<- colnames(myDesd)[8]
+ 
+   voomDMSO <- list(vD, vDy, vDo)
+   desDMSO <- list(myDesd, myDesdy, myDesdo)
+   phenoDMSO <- list(dPheno, dPhenoy, dPhenoo)
+   
+   labD <- c("both", "young", "old")
+   
+    gMat <- NULL ## retain summary statistics
+    gDMSO <- list()
+    for(v in 1:length(voomDMSO)) {
+      
+        res <- camera(voomDMSO[[v]], setsIndices, design=desDMSO[[v]], contrast=coefsd,
+                      sort=TRUE)
+        indo <- res$FDR <= FDRCut
+        gMat <- c(gMat, sum(indo))
+        labb <- paste("M3 malaria effects DMSO", labD[v])
+        
+        if(sum(indo) > 0) {
+            gDMSO[[labb]] <- cbind(res[indo, c("NGenes", "Direction")], 
+                                        signif(res[indo, c("PValue","FDR")], 3))
+        }
+        else {
+          gDMSO[[labb]] <- -1
+        }
+        
+    } ## end for v
+    
+    ## set up summary for printing
+    printgDMSO <- matrix(gMat, ncol=1, byrow=TRUE)
+    dimnames(printgDMSO) <- list(labD, "disease")
+       
+    ## create output string to present datatables
+   outDMSO = NULL
+   for (i in 1:length(gDMSO)) {
+    
+        ## malaria model
+        knit_expanded <- paste0("##`r names(gDMSO)[",i, "]` {.smaller}\n")
+        outDMSO = c(outDMSO, knit_expanded)
+        
+         if(is.null(dim(gDMSO[[i]]))) {
+               knit_expanded <- "No significant gene sets found\n" 
+          }else {
+            knit_expanded <-  paste0("`r datatable(gDMSO[[", i, "]])`\n")
+          }
+        outDMSO = c(outDMSO, knit_expanded)
+   } ## end for i
+    
+   
+     ## generate DMSO data set for both ages
+   dInd <- uPheno$stim == "dmso" & uPheno$visit == "M3"
+   dDat <- uDat[,dInd]
+   dPheno <- uPheno[dInd,]
+   libNormd <- libNorm[dInd]
+   eDatd <- ExpressionSet(assayData=as.matrix(dDat))
+   pData(eDatd) <- dPheno
+
+   ## generate DMSO data set for young
+   dIndy <- uPheno$stim == "dmso" & uPheno$visit == "M3" & uPheno$age=="young"
+   dDaty <- uDat[,dIndy]
+   dPhenoy <- uPheno[dIndy,]
+   libNormdy <- libNorm[dIndy]
+   eDatdy <- ExpressionSet(assayData=as.matrix(dDaty))
+   pData(eDatdy) <- dPhenoy
+
+   ## generate DMSO data set for old
+   dIndo <- uPheno$stim == "dmso" & uPheno$visit == "M3" & uPheno$age=="old"
+   dDato <- uDat[,dIndo]
+   dPhenoo <- uPheno[dIndo,]
+   libNormdo <- libNorm[dIndo]
+   eDatdo <- ExpressionSet(assayData=as.matrix(dDato))
+   pData(eDatdo) <- dPhenoo
+
+    ## get sample sizes
+    t1 <- table(dPheno[, c("age", "malaria", "site")])
+    t2 <- table(dPheno[, c("age", "vaccine", "site")])
+    bag <- cbind(t1[,,1], t2[,,1])
+    man <- cbind(t1[,,2], t2[,,2])
+    colnames(bag)[1:2] <- colnames(man)[1:2] <- c("no malaria", "malaria")
+  
+   ## apply DMSO malaria model
+   myDesd <- model.matrix(~plate + TotalReads + age + malaria, eDatd)
+   myDesdy <- model.matrix(~plate + TotalReads + malaria, eDatdy)
+   myDesdo <- model.matrix(~plate + TotalReads + malaria, eDatdo)
+   
+   vD <- voom(exprs(eDatd), design=myDesd, plot=FALSE, lib.size=libNormd)
+   vDy <- voom(exprs(eDatdy), design=myDesdy, plot=FALSE, lib.size=libNormdy)
+   vDo <- voom(exprs(eDatdo), design=myDesdo, plot=FALSE, lib.size=libNormdo)
+   coefsd<- colnames(myDesd)[8]
+ 
+   voomDMSO <- list(vD, vDy, vDo)
+   desDMSO <- list(myDesd, myDesdy, myDesdo)
+   phenoDMSO <- list(dPheno, dPhenoy, dPhenoo)
+   
+   labD <- c("both", "young", "old")
+   
+    gMat <- NULL ## retain summary statistics
+    gDMSO <- list()
+    for(v in 1:length(voomDMSO)) {
+      
+        res <- camera(voomDMSO[[v]], setsIndices, design=desDMSO[[v]], contrast=coefsd,
+                      sort=TRUE)
+        indo <- res$FDR <= FDRCut
+        gMat <- c(gMat, sum(indo))
+        labb <- paste("M3 malaria effects DMSO", labD[v])
+        
+        if(sum(indo) > 0) {
+            gDMSO[[labb]] <- cbind(res[indo, c("NGenes", "Direction")], 
+                                        signif(res[indo, c("PValue","FDR")], 3))
+        }
+        else {
+          gDMSO[[labb]] <- -1
+        }
+        
+    } ## end for v
+    
+    ## set up summary for printing
+    printgDMSO <- matrix(gMat, ncol=1, byrow=TRUE)
+    dimnames(printgDMSO) <- list(labD, "disease")
+       
+    ## create output string to present datatables
+   outDMSO = NULL
+   for (i in 1:length(gDMSO)) {
+    
+        ## malaria model
+        knit_expanded <- paste0("##`r names(gDMSO)[",i, "]` {.smaller}\n")
+        outDMSO = c(outDMSO, knit_expanded)
+        
+         if(is.null(dim(gDMSO[[i]]))) {
+               knit_expanded <- "No significant gene sets found\n" 
+          }else {
+            knit_expanded <-  paste0("`r datatable(gDMSO[[", i, "]])`\n")
+          }
+        outDMSO = c(outDMSO, knit_expanded)
+   } ## end for i
+    
+   
+```
+
+##Sample Sizes: disease effects for DMSO (M3 only)
+
+<table border = 1>
+<tr>
+<td>
+```{r results='asis', echo=FALSE}
+   print(xtable(bag, caption="Bagamoyo", align=rep("c", ncol(bag)+1)), type = "html")
+```
+</td>
+</tr>
+<tr>
+<td>
+```{r results='asis', echo=FALSE}
+   print(xtable(man, caption="Manhica", align=rep("c", ncol(man)+1)), type = "html")
+```
+</td>
+</tr>
+</table>
+   
+
+<!-- knit GSEA results--> 
+`r paste(knit_child(text = outDMSO), collapse = '\n')`
+
+
+
+##GSEA summary disease effects for DMSO stimulation| FDR cutoff: `r FDRCut`
+
+Number of significant BTM gene sets for malaria effects for DMSO samples.
+
+
+```{r results='asis', echo=FALSE}
+   print(xtable(printgDMSO, align=rep("c", ncol(printgDMSO)+1), auto=TRUE), type = "html")
+```
+
+
+```{r deg1} 
+
+ ## disease stimulation interaction
+ ## myDesM0, M0Dat, M0Pheno, vM0, coefsM0 from gseaM0
+
+ if(DOFIT) { ## ~ 5m
+     ranCor <- duplicateCorrelation(vM0, design=myDesM0, 
+                                    block=M0Pheno$SID)$consensus.correlation
+     fitM0 <- lmFit(vM0, myDesM0, block=M0Pheno$SID, correlation=ranCor)
+     save(fitM0, ranCor, file=paste0(ROOT, "data/lmFitDataSecM0.Rda"))
+ } else {
+      load(file=paste0(ROOT, "data/lmFitDataSecM0.Rda"))
+ }  ## end DOFIT
+ 
+ fitM02 <- eBayes(fitM0, trend=FALSE)
+ 
+ dtM0 <- allGraphs <- list()
+ degSum <- NULL
+ topInd <- c(1,4,5)
+ for(c in coefsM0[3:4]) {
+ 
+     tmp <- topTable(fitM02, number=Inf, coef=c, sort="P")
+     indy <- tmp$P.Value <= pCut
+     tmpy <-  signif(tmp[indy, topInd], 3)
+     colnames(tmpy) <- c("log FC",  "P.value", "FDR")
+     labb <- paste("DEG: M0", c)
+     dtM0[[labb]] <- tmpy
+     degSum <- c(degSum, sum(tmpy$FDR <= FDRCut))
+
+     ## generate graphs
+    graphSet <- list()
+    ress1 <- tmp
+    ress1$FDR <- ifelse(ress1$adj.P.Val > FDRCut, "NonSig", "Sig")   ## label significant genes
+    
+    graphSet[[1]] <- ggplot(ress1, aes(x=P.Value)) + geom_histogram(binwidth=.05) +
+      xlab("p-value") + ggtitle(label=labb) + theme_bw() + theme(aspect.ratio=1,
+                                                                 axis.text.x=element_text(size=10),
+                                          plot.title = element_text(size = 15)) + 
+      scale_x_continuous(breaks=c(0, 0.5, 1))
+    
+    graphSet[[2]] <- ggplot(ress1, aes(x=logFC, y=-log10(P.Value), color=FDR)) +
+      geom_point(shape=1) + ggtitle("logFC vs -log10 p-value") + theme_bw() + 
+      theme(axis.title.y=element_text(size=10), axis.text.x=element_text(size=6), 
+            plot.title = element_text(size = 13)) + 
+      geom_vline(xintercept=c(-1,1), linetype="dashed", color="blue") + 
+    geom_hline(yintercept=-log10(c(0.01)), linetype="dashed", color="blue") +
+      theme(legend.position="none") +  scale_colour_manual(values=c("black", "red")) +
+      theme(aspect.ratio=1)
+    
+    graphSet[[3]] <- ggplot(ress1, aes(x=adj.P.Val)) + geom_histogram(binwidth=.05) +
+      xlab("p-value") + ggtitle("FDR") + theme_bw() + 
+      theme(aspect.ratio=1, plot.title = element_text(size = 15)) + 
+      scale_x_continuous(breaks=c(0, 0.5, 1))
+    
+    allGraphs[[labb]] <- graphSet  
+    
+ }  ## end for c in coefsM0
+
+ outDEG <- matrix(degSum, ncol=1)
+ dimnames(outDEG) <- list(c("csp", "hbs"), "interaction")
+ 
+ ## assemble output in string format for knit_child  
+  outM0 = NULL
+  for (i in 1:length(allGraphs)) {
+    
+      ## vaccine model
+      outM0 <- c(outM0,  paste0("##`r names(allGraphs)[",i, "]` \n"))
+      outM0 <- c(outM0,  paste0("```{r results='asis', echo=FALSE}\ngrid.arrange(allGraphs[[", i, "]][[1]], allGraphs[[", i, "]][[2]], allGraphs[[", i, "]][[3]], nrow=1, ncol=3)\n```\n"))
+    
+      outM0 <- c(outM0,  paste0("##`r names(dtM0)[",i, "]` {.smaller}\n"))
+     if(is.null(dim(dtM0[[i]]))) {
+           knit_expanded <- paste0("No significant genes found\n\n <br>") 
+      }else {
+        knit_expanded <- paste0("```{r results='asis', echo=FALSE}\n\ndatatable(dtM0[[", i, "]])\n\n```\n")
+      }
+      outM0 <-  c(outM0, knit_expanded)
+    
+  } ## end for i
+  
+
+```
+
+
+<!-- knit GSEA results--> 
+`r paste(knit_child(text = outM0), collapse = '\n')`
+        
+
+##DEG summary disease:stimulation interaction| FDR cutoff: `r FDRCut`
+
+Number of significant genes for dmso versus stimulants and disease interaction effects.
+
+
+```{r results='asis', echo=FALSE}
+   print(xtable(outDEG, align=rep("c", ncol(outDEG)+1), auto=TRUE), type = "html")
+```
+
+
+```{r deg2} 
+
+ ## disease stimulation interaction
+ ## myDesm, mDat, mPheno, vm, coefsm from gseaM0-M3
+
+ coefLabm <- c("M3-M0 csp-DMSO interaction", "M3-M0 hsb-DMSO interaction")
+
+
+ if(DOFIT) { ## ~ 15m
+     system.time(ranCor <- duplicateCorrelation(vm, design=myDesm, 
+                                    block=mPheno$SID)$consensus.correlation)
+     system.time(fitm <- lmFit(vm, myDesm, block=mPheno$SID, correlation=ranCor))
+     save(fitm, ranCor, file=paste0(ROOT, "data/lmFitDataSecM0-M3.Rda"))
+ } else {
+      load(file=paste0(ROOT, "data/lmFitDataSecM0-M3.Rda"))
+ }  ## end DOFIT
+ 
+ fitm2 <- eBayes(fitm, trend=FALSE)
+ 
+ dtm <- allGraphs <- list()
+ degSum <- NULL
+ topInd <- c(1,4,5)
+ coefInd <- 0
+ for(c in coefsm) {
+ 
+     coefInd <- coefInd + 1
+     tmp <- topTable(fitm2, number=Inf, coef=c, sort="P")
+     indy <- tmp$P.Value <= pCut
+     tmpy <-  signif(tmp[indy, topInd], 3)
+     colnames(tmpy) <- c("log FC",  "P.value", "FDR")
+     labb <- paste("DEG:", coefLabm[coefInd], c)
+     dtm[[labb]] <- tmpy
+     degSum <- c(degSum, sum(tmpy$FDR <= FDRCut))
+
+     ## generate graphs
+    graphSet <- list()
+    ress1 <- tmp
+    ress1$FDR <- ifelse(ress1$adj.P.Val > FDRCut, "NonSig", "Sig")   ## label significant genes
+    
+    graphSet[[1]] <- ggplot(ress1, aes(x=P.Value)) + geom_histogram(binwidth=.05) +
+      xlab("p-value") + ggtitle(label=labb) + theme_bw() + theme(aspect.ratio=1,
+                                                                 axis.text.x=element_text(size=10),
+                                          plot.title = element_text(size = 15)) + 
+      scale_x_continuous(breaks=c(0, 0.5, 1))
+    
+    graphSet[[2]] <- ggplot(ress1, aes(x=logFC, y=-log10(P.Value), color=FDR)) +
+      geom_point(shape=1) + ggtitle("logFC vs -log10 p-value") + theme_bw() + 
+      theme(axis.title.y=element_text(size=10), axis.text.x=element_text(size=6), 
+            plot.title = element_text(size = 13)) + 
+      geom_vline(xintercept=c(-1,1), linetype="dashed", color="blue") + 
+    geom_hline(yintercept=-log10(c(0.01)), linetype="dashed", color="blue") +
+      theme(legend.position="none") +  scale_colour_manual(values=c("black", "red")) +
+      theme(aspect.ratio=1)
+    
+    graphSet[[3]] <- ggplot(ress1, aes(x=adj.P.Val)) + geom_histogram(binwidth=.05) +
+      xlab("p-value") + ggtitle("FDR") + theme_bw() + 
+      theme(aspect.ratio=1, plot.title = element_text(size = 15)) + 
+      scale_x_continuous(breaks=c(0, 0.5, 1))
+    
+    allGraphs[[labb]] <- graphSet  
+    
+ }  ## end for c in coefsM0
+ 
+  outDEG <- matrix(degSum, ncol=1)
+  dimnames(outDEG) <- list(c("csp", "hbs"), "interaction")
+  
+ ## assemble output in string format for knit_child  
+  outm = NULL
+  for (i in 1:length(allGraphs)) {
+    
+      ## vaccine model
+      outm <- c(outm,  paste0("##`r names(allGraphs)[",i, "]` \n"))
+      outm <- c(outm,  paste0("```{r results='asis', echo=FALSE}\ngrid.arrange(allGraphs[[", i, "]][[1]], allGraphs[[", i, "]][[2]], allGraphs[[", i, "]][[3]], nrow=1, ncol=3)\n```\n"))
+    
+      outm <- c(outm,  paste0("##`r names(dtm)[",i, "]` {.smaller}\n"))
+     if(is.null(dim(dtm[[i]]))) {
+           knit_expanded <- paste0("No significant genes found\n\n <br>") 
+      }else {
+        knit_expanded <- paste0("```{r results='asis', echo=FALSE}\n\ndatatable(dtm[[", i, "]])\n\n```\n")
+      }
+      outm <-  c(outm, knit_expanded)
+    
+  } ## end for i
+  
+ 
+```
+
+
+<!-- knit GSEA results--> 
+`r paste(knit_child(text = outm), collapse = '\n')`
+        
+##DEG summary visit:stimulation interaction| FDR cutoff: `r FDRCut`
+
+Number of significant genes for dmso versus stimulants and visit interaction effects.
+
+```{r results='asis', echo=FALSE}
+   print(xtable(outDEG, align=rep("c", ncol(outDEG)+1), auto=TRUE), type = "html")
+```
+
+
+
+```{r deg2a} 
+
+ ## disease stimulation interaction
+ ## myDesm, mDat, mPheno, vm, coefsm from gseaM0-M3
+
+ coefLabm <- c("M3-M0 csp-DMSO interaction", "M3-M0 hsb-DMSO interaction")
+
+
+ if(DOFIT) { ## ~ 15m
+     system.time(ranCor <- duplicateCorrelation(vmc, design=myDesmc, 
+                                    block=mPhenoc$SID)$consensus.correlation)
+     system.time(fitm <- lmFit(vmc, myDesmc, block=mPhenoc$SID, correlation=ranCor))
+     save(fitm, ranCor, file=paste0(ROOT, "data/lmFitDataSecM0-M3Comp.Rda"))
+ } else {
+      load(file=paste0(ROOT, "data/lmFitDataSecM0-M3Comp.Rda"))
+ }  ## end DOFIT
+ 
+ fitm2 <- eBayes(fitm, trend=FALSE)
+ 
+ dtm <- allGraphs <- list()
+ degSum <- NULL
+ topInd <- c(1,4,5)
+ coefInd <- 0
+ for(c in coefsm) {
+ 
+     coefInd <- coefInd + 1
+     tmp <- topTable(fitm2, number=Inf, coef=c, sort="P")
+     indy <- tmp$P.Value <= pCut
+     tmpy <-  signif(tmp[indy, topInd], 3)
+     colnames(tmpy) <- c("log FC",  "P.value", "FDR")
+     labb <- paste("DEG:", coefLabm[coefInd], c)
+     dtm[[labb]] <- tmpy
+     degSum <- c(degSum, sum(tmpy$FDR <= FDRCut))
+
+     ## generate graphs
+    graphSet <- list()
+    ress1 <- tmp
+    ress1$FDR <- ifelse(ress1$adj.P.Val > FDRCut, "NonSig", "Sig")   ## label significant genes
+    
+    graphSet[[1]] <- ggplot(ress1, aes(x=P.Value)) + geom_histogram(binwidth=.05) +
+      xlab("p-value") + ggtitle(label=labb) + theme_bw() + theme(aspect.ratio=1,
+                                                                 axis.text.x=element_text(size=10),
+                                          plot.title = element_text(size = 15)) + 
+      scale_x_continuous(breaks=c(0, 0.5, 1))
+    
+    graphSet[[2]] <- ggplot(ress1, aes(x=logFC, y=-log10(P.Value), color=FDR)) +
+      geom_point(shape=1) + ggtitle("logFC vs -log10 p-value") + theme_bw() + 
+      theme(axis.title.y=element_text(size=10), axis.text.x=element_text(size=6), 
+            plot.title = element_text(size = 13)) + 
+      geom_vline(xintercept=c(-1,1), linetype="dashed", color="blue") + 
+    geom_hline(yintercept=-log10(c(0.01)), linetype="dashed", color="blue") +
+      theme(legend.position="none") +  scale_colour_manual(values=c("black", "red")) +
+      theme(aspect.ratio=1)
+    
+    graphSet[[3]] <- ggplot(ress1, aes(x=adj.P.Val)) + geom_histogram(binwidth=.05) +
+      xlab("p-value") + ggtitle("FDR") + theme_bw() + 
+      theme(aspect.ratio=1, plot.title = element_text(size = 15)) + 
+      scale_x_continuous(breaks=c(0, 0.5, 1))
+    
+    allGraphs[[labb]] <- graphSet  
+    
+ }  ## end for c in coefsM0
+ 
+  outDEG <- matrix(degSum, ncol=1)
+  dimnames(outDEG) <- list(c("csp", "hbs"), "interaction")
+  
+ ## assemble output in string format for knit_child  
+  outm = NULL
+  for (i in 1:length(allGraphs)) {
+    
+      ## vaccine model
+      outm <- c(outm,  paste0("##`r names(allGraphs)[",i, "]` \n"))
+      outm <- c(outm,  paste0("```{r results='asis', echo=FALSE}\ngrid.arrange(allGraphs[[", i, "]][[1]], allGraphs[[", i, "]][[2]], allGraphs[[", i, "]][[3]], nrow=1, ncol=3)\n```\n"))
+    
+      outm <- c(outm,  paste0("##`r names(dtm)[",i, "]` {.smaller}\n"))
+     if(is.null(dim(dtm[[i]]))) {
+           knit_expanded <- paste0("No significant genes found\n\n <br>") 
+      }else {
+        knit_expanded <- paste0("```{r results='asis', echo=FALSE}\n\ndatatable(dtm[[", i, "]])\n\n```\n")
+      }
+      outm <-  c(outm, knit_expanded)
+    
+  } ## end for i
+  
+ 
+```
+
+
+<!-- knit GSEA results--> 
+`r paste(knit_child(text = outm), collapse = '\n')`
+        
+
+##DEG summary visit:stimulation interaction| FDR cutoff: `r FDRCut`
+
+Number of significant genes for dmso versus stimulants and visit interaction effects.
+
+
+```{r results='asis', echo=FALSE}
+   print(xtable(outDEG, align=rep("c", ncol(outDEG)+1), auto=TRUE), type = "html")
+```
+
+
+
+```{r deg3}
+
+##voomDMSO, desDMSO, coefsd, phenoDMSO from gseaDMSO
+
+labD <- c("both", "young", "old")
+
+fitDMSO <- list()
+ for(i in 1:length(voomDMSO)) {
+     fitm <- lmFit(voomDMSO[[i]], desDMSO[[i]])
+     fitm2 <- eBayes(fitm, trend=FALSE)
+     fitDMSO[[i]] <- fitm2
+ } ## end for i   
+  
+degSum <- NULL ## retain summary statistics
+dtdmso <- allGraphs <- list()
+for(v in 1:length(voomDMSO)) {
+
+     tmp <- topTable(fitDMSO[[v]], number=Inf, coef=coefsd, sort="P")
+     indy <- tmp$P.Value <= pCut
+     tmpy <-  signif(tmp[indy, topInd], 3)
+     colnames(tmpy) <- c("log FC",  "P.value", "FDR")
+     labb <- paste("DEG:", labD[v])
+     dtdmso[[labb]] <- tmpy
+     degSum <- c(degSum, sum(tmpy$FDR <= FDRCut))
+
+     ## generate graphs
+    graphSet <- list()
+    ress1 <- tmp
+    ress1$FDR <- ifelse(ress1$adj.P.Val > FDRCut, "NonSig", "Sig")   ## label significant genes
+    
+    graphSet[[1]] <- ggplot(ress1, aes(x=P.Value)) + geom_histogram(binwidth=.05) +
+      xlab("p-value") + ggtitle(label=labb) + theme_bw() + theme(aspect.ratio=1,
+                                                                 axis.text.x=element_text(size=10),
+                                          plot.title = element_text(size = 15)) + 
+      scale_x_continuous(breaks=c(0, 0.5, 1))
+    
+    graphSet[[2]] <- ggplot(ress1, aes(x=logFC, y=-log10(P.Value), color=FDR)) +
+      geom_point(shape=1) + ggtitle("logFC vs -log10 p-value") + theme_bw() + 
+      theme(axis.title.y=element_text(size=10), axis.text.x=element_text(size=6), 
+            plot.title = element_text(size = 13)) + 
+      geom_vline(xintercept=c(-1,1), linetype="dashed", color="blue") + 
+    geom_hline(yintercept=-log10(c(0.01)), linetype="dashed", color="blue") +
+      theme(legend.position="none") +  scale_colour_manual(values=c("black", "red")) +
+      theme(aspect.ratio=1)
+    
+    graphSet[[3]] <- ggplot(ress1, aes(x=adj.P.Val)) + geom_histogram(binwidth=.05) +
+      xlab("p-value") + ggtitle("FDR") + theme_bw() + 
+      theme(aspect.ratio=1, plot.title = element_text(size = 15)) + 
+      scale_x_continuous(breaks=c(0, 0.5, 1))
+    
+    allGraphs[[labb]] <- graphSet  
+    
+ }  ## end for v in voomDMSO
+     
+  outDEG <- matrix(degSum, ncol=1)
+  dimnames(outDEG) <- list(labD, "interaction")
+  
+ ## assemble output in string format for knit_child  
+  outm = NULL
+  for (i in 1:length(allGraphs)) {
+    
+      outm <- c(outm,  paste0("##`r names(allGraphs)[",i, "]` \n"))
+      outm <- c(outm,  paste0("```{r results='asis', echo=FALSE}\ngrid.arrange(allGraphs[[", i, "]][[1]], allGraphs[[", i, "]][[2]], allGraphs[[", i, "]][[3]], nrow=1, ncol=3)\n```\n"))
+    
+      outm <- c(outm,  paste0("##`r names(dtdmso)[",i, "]` {.smaller}\n"))
+     if(is.null(dim(dtdmso[[i]]))) {
+           knit_expanded <- paste0("No significant genes found\n\n <br>") 
+      }else {
+        knit_expanded <- paste0("```{r results='asis', echo=FALSE}\n\ndatatable(dtdmso[[", i, "]])\n\n```\n")
+      }
+      outm <-  c(outm, knit_expanded)
+    
+  } ## end for i
+  
+
+
+```
+
+
+
+<!-- knit GSEA results--> 
+`r paste(knit_child(text = outm), collapse = '\n')`
+        
+
+##DEG summary disease effects for DMSO stimulation| FDR cutoff: `r FDRCut`
+
+Number of significant genes for dmso versus stimulants and visit interaction effects.
+
+
+```{r results='asis', echo=FALSE}
+   print(xtable(outDEG, align=rep("c", ncol(outDEG)+1), auto=TRUE), type = "html")
+```
+
+
+
+##Session info
+
+```{r sessionInfo}
+
+   ## generate version information
+   sessionInfo()
+```
+
+
